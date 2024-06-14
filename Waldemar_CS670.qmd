@@ -1,0 +1,879 @@
+---
+title: CO2 Emissions
+format:
+  html:
+    code-fold: true
+    cold-tools: true
+jupyter_execute:
+  execute: true
+  output: true
+jupyter: python3
+---
+
+### **Motivation**
+
+According to climate.gov: “Carbon dioxide is Earth’s most important greenhouse gas: a gas that absorbs and radiates heat. Unlike oxygen or nitrogen (which make up most of our atmosphere), greenhouse gases absorb heat radiating from the Earth’s surface and re-release it in all directions—including back toward Earth’s surface.” Understanding the trends and factors which are related to CO2 levels (like emissions) is important for forging a path to improve our current climate change trajectory.
+
+#####  **Questions to Answer**
+
+The following are questions I would like to address with this project.
+1.   How have carbon dioxide emissions trends varied across different states from 1970 to 2021?
+2.   Which sectors have been the most significant contributors to emissions?
+4.   Is there a discernible pattern among states with similar emission levels?
+
+#####  **About the Datasets**
+
+I have selected the dataset titled “U.S. Carbon Dioxide Emissions by State, Sector, and Fuel Type” available on Kaggle. This comprehensive dataset, compiled by Alistair King, spans from 1970 to 2021 and includes emissions data organized by state, sector (residential, commercial, transportation, electric power, and industrial), and fuel type (coal, petroleum, natural gas, and combined fuels). The data was sourced from the U.S. Energy Information Administration via an API query. This dataset was chosen for its detailed longitudinal data covering over five decades, allowing for an in-depth analysis of emissions trends. The breakdown by state, sector, and fuel type not only provides a granular view of the data but also addresses a critical environmental issue—carbon dioxide emissions—which remains a significant challenge. Additionally, the dataset’s structure supports complex analyses without an overwhelming number of predictors.
+
+I augmented the CO2 Emissions dataset with population by state. However, this dataset only ranged from 1970 to 2017, so I had to drop 6 years off the original dataset in order to keep all the predictors even. While shortening the time period may have some negative effect on the accuracy of my models, I think the addition of population will help more than the loss of a 6 years will hurt. This second dataset was also retrieved from kaggle, and is called Historical State Populations (1900 - 2017). The datset was created by Hassen Morad, and was retrieved from the Federal Reserve Bank of St. Louis. 
+
+```{python}
+#| tags: []
+#All the imports
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import numpy as np
+import geopandas as gpd
+import folium
+import json
+from sklearn.linear_model import LinearRegression
+from sklearn.linear_model import Ridge
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from branca.colormap import linear
+import statsmodels.api as sm
+from sklearn.model_selection import train_test_split, cross_val_score, KFold
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import warnings
+from sklearn.cluster import KMeans
+```
+
+**Normalize and prepare the data**
+
+- Remove the items which are sums of other items (i.e. United states emissions = sum of all states)
+- Encode categorical data
+- Add annual Population data by state (it was EXTREMELY difficult to do this).
+
+```{python}
+#| tags: []
+# Load the emissions dataset
+emissions = pd.read_csv('emissions.csv')
+
+# Load GDP dataset
+GDP = pd.read_csv('gdp_by_state_1970_2021.csv')
+
+# Load Population dataset
+state_pops = pd.read_csv('state_pops.csv')
+```
+
+```{python}
+#| tags: []
+# Melt the state_pops DataFrame to long format
+state_pops_long = state_pops.melt(id_vars=['Year'], var_name='state-name', value_name='Population')
+
+# Ensure the 'year' column in emissions is integer
+emissions['year'] = emissions['year'].astype(int)
+
+# Merge the emissions DataFrame with the population DataFrame on 'state-name' and 'year'
+merged_df = pd.merge(emissions, state_pops_long, left_on=['state-name', 'year'], right_on=['state-name', 'Year'], how='left')
+
+# Drop the 'Year' column as it's redundant after the merge
+merged_df = merged_df.drop(columns=['Year'])
+
+# Remove all entries after 2017
+filtered_df = merged_df[merged_df['year'] <= 2017]
+
+# Save the filtered DataFrame
+filtered_df.to_csv('filtered_emissions_population.csv', index=False)
+
+#Filter out 'United States'
+emissions_filter = filtered_df[~filtered_df['state-name'].isin(['United States'])]
+
+#Filter out entries where "sector-name" = "Total carbon dioxide emissions..."
+minimal_df = emissions_filter[(emissions_filter['sector-name'] != 'Total carbon dioxide emissions from all sectors') & (emissions_filter['fuel-name'] != 'All Fuels')]
+
+# Drop the 'state' column - I initially encoded it, but it didnt make sense, so I tried to get rid of it.
+if 'state' in minimal_df.columns:
+    minimal_df = minimal_df.drop(columns=['state'])
+    
+# Encode categorical variables
+label_encoder = LabelEncoder()
+minimal_df = minimal_df.assign(
+    sector=label_encoder.fit_transform(minimal_df['sector-name']),
+    fuel=label_encoder.fit_transform(minimal_df['fuel-name']),
+)
+
+minimal_df.head()
+```
+
+### **Data Visualization**
+
+Below are graphs and charts, which help to visualize and understand the data in the dataset. 
+
+#### **Summed State Emissions**
+
+Simple sum of all emissions for each state per each year in the dataset. Emissions have grown in a generally linear way between the early to mid 1980s to around 2007 or 2008. There is a slight decrease after the 2007/2008 timeframe. The downward trend in CO2 emissions was interesting to me, so I did some searching for what might be the cause. Ultimately I found in that around 2007 there became an emphasis on using more natural gas in place of coal. Analysis later will examine if there is a visible connection in this data. 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Group data by year and calculate average emissions per year
+avg_emissions_per_year = minimal_df.groupby('year')['value'].mean()
+
+# Plot average emissions per year
+plt.figure(figsize=(12, 6))
+plt.plot(avg_emissions_per_year, marker='o')
+plt.title('Average Emissions per Year')
+plt.xlabel('Year')
+plt.ylabel('Average Emissions')
+plt.grid(True)
+plt.show()
+```
+
+#### **Highest & Lowest Polluting State with US Median and Mean**
+
+This graph shows the state with the highest CO2 Emissions (Texas) and lowest (DC), it also shows the mean and median for all states in the US for reference. Texas' CO2 emissions are significantly higher across all years in the dataset than the average (and lowest CO2 producing state). 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Group by state and year, then sum the emissions
+group_state_year_emissions = minimal_df.groupby(['state-name', 'year'])['value'].sum().reset_index()
+
+# Identify the states with the lowest and highest total emissions
+lowest_state = group_state_year_emissions.iloc[group_state_year_emissions['value'].idxmin()]['state-name']
+highest_state = group_state_year_emissions.iloc[group_state_year_emissions['value'].idxmax()]['state-name']
+
+# Calculate the mean and median emissions across all states for each year
+mean_emissions_by_year = group_state_year_emissions.groupby('year')['value'].mean().reset_index()
+median_emissions_by_year = group_state_year_emissions.groupby('year')['value'].median().reset_index()
+
+# Plots
+plt.figure(figsize=(14, 8))
+
+#Lowest emissions
+lowest_state_data = group_state_year_emissions[group_state_year_emissions['state-name'] == lowest_state]
+plt.plot(lowest_state_data['year'], lowest_state_data['value'], label=f'Lowest: {lowest_state}', linewidth=2)
+
+#Highest emissions
+highest_state_data = group_state_year_emissions[group_state_year_emissions['state-name'] == highest_state]
+plt.plot(highest_state_data['year'], highest_state_data['value'], label=f'Highest: {highest_state}', linewidth=2)
+
+# Plot the mean emissions
+plt.plot(mean_emissions_by_year['year'], mean_emissions_by_year['value'], label='Mean (US)', linestyle='--', linewidth=2)
+
+# Plot the median emissions
+plt.plot(median_emissions_by_year['year'], median_emissions_by_year['value'], label='Median (US)', linestyle='-.', linewidth=2)
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.title('Emissions Trends for Lowest, Highest States, and Mean/Median/US Emissions (1970-2021)')
+plt.legend(loc='upper left')
+plt.grid(True)
+plt.show()
+```
+
+#### **Highest 5 and Lowest 5 Polluters**
+
+This block expands upon the last by showing the top 5 states for CO2 emissions, and the lowest 5 states for C02 emissions in the second graph.
+
+**Highest Polluters**: 
+1. Texas
+2. California
+3. Pennsylvania
+4. Ohio
+5. Illinois
+
+**Lowest Polluters**: 
+1. Washington DC
+2. Vermont
+3. Rhode Island
+4. South Dakota
+5. Idaho
+
+Washington DC is the only state of the highest and lowest polluters that has significantly reduced its CO2 emissions. Vermont has kept almost a flat level of emissions. The others have slightly increased, though somewhat less than the average state in the US.  
+
+```{python}
+#| tags: []
+# Calculate the total emissions for each state over the entire period
+total_emissions_by_state = group_state_year_emissions.groupby('state-name')['value'].sum().reset_index()
+
+# Identify the top 5 states with the highest emissions and the lowest 5 states with the lowest emissions
+top_5_states = total_emissions_by_state.nlargest(5, 'value')['state-name']
+lowest_5_states = total_emissions_by_state.nsmallest(5, 'value')['state-name']
+
+# Calculate the mean and median emissions across all states for each year
+mean_emissions_by_year = group_state_year_emissions.groupby('year')['value'].mean().reset_index()
+median_emissions_by_year = group_state_year_emissions.groupby('year')['value'].median().reset_index()
+
+# Plot emissions trends for the top 5 states
+plt.figure(figsize=(14, 8))
+for state in top_5_states:
+    state_data = group_state_year_emissions[group_state_year_emissions['state-name'] == state]
+    plt.plot(state_data['year'], state_data['value'], label=state, linewidth=2)
+plt.plot(mean_emissions_by_year['year'], mean_emissions_by_year['value'], label='Mean (US)', linestyle='--', linewidth=2)
+plt.plot(median_emissions_by_year['year'], median_emissions_by_year['value'], label='Median (US)', linestyle='-.', linewidth=2)
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.title('Emissions Trends for Top 5 States and Mean/Median (1970-2017)')
+plt.legend(loc='upper left')
+plt.grid(True)
+plt.show()
+
+# Plot emissions trends for the lowest 5 states
+plt.figure(figsize=(14, 8))
+for state in lowest_5_states:
+    state_data = group_state_year_emissions[group_state_year_emissions['state-name'] == state]
+    plt.plot(state_data['year'], state_data['value'], label=state, linewidth=2)
+plt.plot(mean_emissions_by_year['year'], mean_emissions_by_year['value'], label='Mean (US)', linestyle='--', linewidth=2)
+plt.plot(median_emissions_by_year['year'], median_emissions_by_year['value'], label='Median (US)', linestyle='-.', linewidth=2)
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.title('Emissions Trends for Lowest 5 States and Mean/Median (1970-2017)')
+plt.legend(loc='upper left')
+plt.grid(True)
+plt.show()
+```
+
+#### **Maps of CO2 Emissions by State for 1970 & 2017**
+
+Maps with each state color coded to show their emissions. Color scale is the same across both years displayed, enabling a visual comparison of states that have increased their emissions since 1970 and those that have decreased them. 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Load US states shapefile
+shapefile_path = 'tl_2021_us_state.shp'
+us_states = gpd.read_file(shapefile_path)
+
+# Filter emissions data for the years 1970 & 2021
+emissions_1970 = minimal_df[minimal_df['year'] == 1970]
+emissions_2017 = minimal_df[minimal_df['year'] == 2017]
+
+# Calculate total emissions for each state in 1970 & 2017
+total_emissions_1970 = emissions_1970.groupby('state-name')['value'].sum().reset_index()
+total_emissions_2017 = emissions_2017.groupby('state-name')['value'].sum().reset_index()
+
+# Find global min and max emissions values across both years
+global_min = min(total_emissions_1970['value'].min(), total_emissions_2017['value'].min())
+global_max = max(total_emissions_1970['value'].max(), total_emissions_2017['value'].max())
+
+# Define the color scale with specific thresholds
+threshold_scale = [global_min, (global_max-global_min)/4, (global_max-global_min)/2, 3*(global_max-global_min)/4, global_max]
+
+# Merge emissions data with geometrical data for 1970
+emissions_geo_df_1970 = us_states.merge(total_emissions_1970, left_on='NAME', right_on='state-name', how='left')
+
+# Function to convert GeoDataFrame to GeoJSON with renamed properties
+def gdf_to_geojson(gdf, properties):
+    geojson = json.loads(gdf.to_json())
+    for feature in geojson['features']:
+        feature['properties'] = {prop: feature['properties'][prop] for prop in properties}
+    return geojson
+
+# Convert merged GeoDataFrame to GeoJSON
+geojson_1970 = gdf_to_geojson(emissions_geo_df_1970, ['NAME', 'value'])
+
+# Create a folium map for 1970 centered on the United States
+m_1970 = folium.Map(location=[37.8, -96], zoom_start=4)
+
+# Add the emissions data for 1970 as a choropleth layer
+folium.Choropleth(
+    geo_data=geojson_1970,
+    name='choropleth',
+    data=total_emissions_1970,
+    columns=['state-name', 'value'],
+    key_on='feature.properties.NAME',
+    fill_color='YlOrRd',
+    fill_opacity=0.7,
+    line_opacity=0.2,
+    legend_name='Total Emissions 1970',
+    threshold_scale=threshold_scale,
+    nan_fill_color='white'
+).add_to(m_1970)
+
+# Add a layer control for the 1970 map
+folium.LayerControl().add_to(m_1970)
+
+# Save the 1970 map to an HTML file
+m_1970.save('us_emissions_heatmap_1970.html')
+
+# Display
+m_1970
+```
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Merge emissions data with geometrical data for 2021
+emissions_geo_df_2017 = us_states.merge(total_emissions_2017, left_on='NAME', right_on='state-name', how='left')
+
+# Function to convert GeoDataFrame to GeoJSON with renamed properties
+def gdf_to_geojson(gdf, properties):
+    geojson = json.loads(gdf.to_json())
+    for feature in geojson['features']:
+        feature['properties'] = {prop: feature['properties'][prop] for prop in properties}
+    return geojson
+
+# Convert merged GeoDataFrame to GeoJSON
+geojson_2017 = gdf_to_geojson(emissions_geo_df_2017, ['NAME', 'value'])
+
+# Create a folium map for 2021 centered on the United States
+m_2017 = folium.Map(location=[37.8, -96], zoom_start=4)
+
+# Add the emissions data for 2021 as a choropleth layer
+folium.Choropleth(
+    geo_data=geojson_2017,
+    name='choropleth',
+    data=total_emissions_2017,
+    columns=['state-name', 'value'],
+    key_on='feature.properties.NAME',
+    fill_color='YlOrRd',
+    fill_opacity=0.7,
+    line_opacity=0.2,
+    legend_name='Total Emissions 2017',
+    threshold_scale=threshold_scale,
+    nan_fill_color='white'
+).add_to(m_2017)
+
+# Add a layer control for the 2021 map
+folium.LayerControl().add_to(m_2017)
+
+# Save the 2021 map to an HTML file
+m_2017.save('us_emissions_heatmap_2021.html')
+
+# Display
+m_2017
+```
+
+#### **Emissions by Sector**
+
+Bar graphs which display which sectors contribute most to CO2 Emissions in 1970 and 2021 to give a general idea of the changes in dominant sectors over the time period covered in the dataset.
+
+Electrical Power and Transportation sectors make up the bulk of the CO2 emissions. 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Aggregate emissions by sector for 1970
+emissions_1970 = minimal_df[minimal_df['year'] == 1970].groupby('sector-name')['value'].sum()
+
+# Aggregate emissions by sector for 2021
+emissions_2017 = minimal_df[minimal_df['year'] == 2017].groupby('sector-name')['value'].sum()
+
+# Combine the data into a single DataFrame
+combined_emissions = pd.DataFrame({'1970': emissions_1970, '2017': emissions_2017}).fillna(0)
+
+# Plotting sector-wise emissions for 1970 and 2017 side by side
+ax = combined_emissions.plot(kind='bar', figsize=(12, 6), color=['skyblue', 'orange'])
+plt.title('Total Emissions by Sector in 1970 and 2017')
+plt.xlabel('Sector')
+plt.ylabel('Total Emissions')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y')
+plt.legend(title='Year')
+plt.tight_layout()
+plt.show()
+
+# Aggregate emissions by sector and year
+sector_year_emissions = minimal_df.groupby(['year', 'sector-name'])['value'].sum().reset_index()
+
+# Pivot the data to have years as columns and sectors as rows
+pivot_df = sector_year_emissions.pivot(index='year', columns='sector-name', values='value')
+
+# Plotting the data
+plt.figure(figsize=(12, 8))
+
+# Plot each sector as a line
+for column in pivot_df.columns:
+    plt.plot(pivot_df.index, pivot_df[column], label=column)
+
+plt.title('Total Emissions by Sector Over Time')
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.legend(title='Sector')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+#### **Emissions by Fuel Type**
+
+Bar graphs which display which fuel types contribute most to CO2 Emissions in 1970 and 2017 to give a general idea of the changes in dominant fuel types over the time period covered in the dataset. Notably, coals impact on CO2 emissions has lowered since 1970 (as previously mentioned, this could have some impact on the lowering CO2 emissions around 2008).  
+
+Petroleum has produced the highest CO2 emissions over the time period of this dataset. 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Aggregate emissions by sector for 1970
+fuel_emissions_1970 = minimal_df[minimal_df['year'] == 1970].groupby('fuel-name')['value'].sum()
+
+# Aggregate emissions by sector for 2021
+fuel_emissions_2017 = minimal_df[minimal_df['year'] == 2017].groupby('fuel-name')['value'].sum()
+
+# Combine the data into a single DataFrame
+combined_fuel_emissions = pd.DataFrame({'1970': fuel_emissions_1970, '2017': fuel_emissions_2021}).fillna(0)
+
+# Plotting sector-wise emissions for 1970 and 2017 side by side
+ax = combined_fuel_emissions.plot(kind='bar', figsize=(12, 6), color=['skyblue', 'orange'])
+plt.title('Total Emissions by Fuel Type in 1970 and 2017')
+plt.xlabel('Fuel Type')
+plt.ylabel('Total Emissions')
+plt.xticks(rotation=45, ha='right')
+plt.grid(axis='y')
+plt.legend(title='Year')
+plt.tight_layout()
+plt.show()
+
+# Aggregate emissions by sector and year
+fuel_emissions = minimal_df.groupby(['year', 'fuel-name'])['value'].sum().reset_index()
+
+# Pivot the data to have years as columns and sectors as rows
+pivot_df = fuel_emissions.pivot(index='year', columns='fuel-name', values='value')
+
+# Plotting the data
+plt.figure(figsize=(12, 8))
+
+# Plot each sector as a line
+for column in pivot_df.columns:
+    plt.plot(pivot_df.index, pivot_df[column], label=column)
+
+plt.title('Total Emissions by Fuel Type Over Time')
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.legend(title='Fuel Type')
+plt.grid(True)
+plt.tight_layout()
+plt.show()
+```
+
+#### **Correlation Matrix**
+
+This correlation matrix shows that there is a fairly strong (in the context of the predictors present) correlation between population and emissions. A still somewhat correlated response (though not strongly correlated) are sector and fuel type and value - both are 0.12. This brings up a concern that there may be some multicollinearity which may affect regression models.  
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Select relevant columns for correlation analysis
+correlation_df = minimal_df[['year', 'sector', 'fuel', 'value', 'Population']]
+
+# Calculate the correlation matrix
+correlation_matrix = correlation_df.corr()
+
+# Plot the correlation matrix
+plt.figure(figsize=(10, 8))
+sns.heatmap(correlation_matrix, annot=True, cmap='coolwarm', vmin=-1, vmax=1)
+plt.title('Correlation Matrix')
+plt.show()
+```
+
+#### **Linear Models for US, Texas, and DC**
+
+It would seem that as population grows emissions also grows (to an extent) so fitting a linear model might be an okay way to predict emissions, though it is clearly not perfect. However, since our text mentioned that sometimes simple models perform the best, I started here. The population of this country has grown and so has our CO2 emissions. First I fitted a model just using year and value, but progress later in this notebook to using polynomial regression with year, and population included. 
+
+US - This model only explains about 59.7% of the variability in emissions on the training set, while performing slightly better on the test set at 64.2% . Which makes sense as the fit is clearly not great, despite somewhat following the general upward trend of the data. P-value of 1.30e-08 tells us that the model is statistically significant.
+
+Texas - This model explains about 81.6% of the variability in emissions on the training set, while performing slightly worse on the test set at 76.6%. This model is also clearly better fit to the data (just by looking at the graph). AIC of this model (388.6) shows a much better fit than that of the US model (551.9).
+
+DC - The R-Squared of this model is 0.6873 meaning 68.7% of the variability in emissions are explained by this model (training set). The test set of this model performed slightly better at 74.9%.  The fit lies between that of Texas and the US models.
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Function to create and plot linear model and print summary statistics
+def create_linear_model(data, state_name):
+    # Prepare data
+    X = data[['year']]
+    y = data['value']
+    
+    # Split data into training and testing set
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Add a constant to the model (intercept)
+    X_train = sm.add_constant(X_train)
+    X_test = sm.add_constant(X_test)
+    
+    # Fit the model using statsmodels
+    model = sm.OLS(y_train, X_train).fit()
+    
+    
+    
+    # Print the summary statistics
+    print(f"Summary for {state_name}:\n")
+    print(model.summary())
+    
+    # Predict the values on the training set
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+    
+    # Calculate and print metrics for training set
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    train_mse = mean_squared_error(y_train, y_train_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+    print(f"\nTraining Set Metrics for {state_name}\n"
+          f"MAE: {train_mae:.4f}\n"
+          f"MSE: {train_mse:.4f}\n"
+          f"R²: {train_r2:.4f}\n")
+    
+    # Calculate and print metrics for test set
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    print(f"Test Set Metrics for {state_name}\n"
+          f"MAE: {test_mae:.4f}\n"
+          f"MSE: {test_mse:.4f}\n"
+          f"R²: {test_r2:.4f}\n")
+    
+    # Plot the actual and predicted values
+    plt.figure(figsize=(10, 6))
+    plt.scatter(X_train['year'], y_train, color='blue', label='Actual Emissions (Train)')
+    plt.scatter(X_test['year'], y_test, color='red', label='Actual Emissions (Test)')
+    plt.plot(X_train['year'], y_train_pred, 'g--', label='Predicted Emissions (Train)')
+    plt.plot(X_test['year'], y_test_pred, 'y--', label='Predicted Emissions (Test)')
+    plt.xlabel('Year')
+    plt.ylabel('Emissions')
+    plt.title(f'Emissions Over Time in {state_name}')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return model
+
+# Filter data for the US, Texas, and the District of Columbia
+us_data = minimal_df.groupby('year')['value'].sum().reset_index()
+texas_data = minimal_df[minimal_df['state-name'] == 'Texas'].groupby('year')['value'].sum().reset_index()
+dc_data = minimal_df[minimal_df['state-name'] == 'District of Columbia'].groupby('year')['value'].sum().reset_index()
+
+# Create and plot linear models
+us_model = create_linear_model(us_data, 'the United States')
+texas_model = create_linear_model(texas_data, 'Texas')
+dc_model = create_linear_model(dc_data, 'the District of Columbia')
+```
+
+#### **Polynomial Regression Using Only Year as a Predictor**
+
+For this polynomial regression I split the data into 80% for training and 20% for testing. Due to the small sample size this means there is very little data in each grouping (training and test). Additionally,  I used k-fold cross validation to address some very confusing results (detailed below in the US section). This provided me with a decent ability to compare results across different subsets of the dataset to see if outliers can significantly affect things. 
+
+US - This model only explains about 69.7% of the variability in emissions (training) The test results only explain about 73% of the variability in emissions. My original polynomial regression (prior to adding the population data and shortening the time period had a very poor testing r squared, so I incorporated k-fold cross validation as a means to trouble shoot. I was able to determine from adding that that there could be some subsets of the dataset which have enough outliers to make the test results very poor. Even in this version there is one model using k-fold cross validation where the r squared is only 53%. 
+
+Texas - This model explains about 93% of the variability in emissions (training), and 92% in the test set. This model is clearly a good fit. The mean squared error and the mean absolute error are very similar in both the training and test in both the traditionally split and k-fold split data - no overfitting here. 
+
+DC - Training and testing r squred are both about .85. The k-fold cross validation r squared was very similar to the r squared of the standard split.  
+
+A major conlusion that can be gleaned from this comparison is that there is a significant challenge in modeling the emissions of the whole United States compared to modeling a single state. The single states clearly have less complex relationships than all 50 States plus DC. 
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Suppress UserWarning from sklearn
+warnings.filterwarnings(action='ignore', category=UserWarning, module='sklearn')
+
+def create_polynomial_model(data, state_name, degree):
+    # Separate features and target
+    X = data[['year']]
+    y = data['value']
+    
+    # Split data into training and testing set
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    # Transform features into polynomial features
+    poly = PolynomialFeatures(degree=degree, include_bias=False)
+    X_train_poly = poly.fit_transform(X_train)
+    X_test_poly = poly.transform(X_test)
+
+    # Convert the numpy arrays back to DataFrame to keep the feature names
+    feature_names = poly.get_feature_names_out(input_features=['year'])
+    X_train_poly_df = pd.DataFrame(X_train_poly, columns=feature_names, index=X_train.index)
+    X_test_poly_df = pd.DataFrame(X_test_poly, columns=feature_names, index=X_test.index)
+    
+    # Fit the model using statsmodels
+    X_train_poly_sm = sm.add_constant(X_train_poly_df)
+    model = sm.OLS(y_train, X_train_poly_sm).fit()
+    
+    # Print the summary statistics
+    print(f"Summary for {state_name}:\n")
+    print(model.summary())
+    
+    # Predict the values using the DataFrame with constant added
+    y_train_pred = model.predict(X_train_poly_sm)
+    X_test_poly_sm = sm.add_constant(X_test_poly_df)
+    y_test_pred = model.predict(X_test_poly_sm)
+    
+    # Calculate and print metrics for training set
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    train_mse = mean_squared_error(y_train, y_train_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+    print(f"\nTraining Set Metrics for {state_name} (Polynomial Degree {degree}):\n"
+          f"MAE: {train_mae:.4f}\n"
+          f"MSE: {train_mse:.4f}\n"
+          f"R²: {train_r2:.4f}\n")
+    
+    # Calculate and print metrics for test set
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    print(f"Test Set Metrics for {state_name} (Polynomial Degree {degree}):\n"
+          f"MAE: {test_mae:.4f}\n"
+          f"MSE: {test_mse:.4f}\n"
+          f"R²: {test_r2:.4f}\n")
+    
+    # Perform cross-validation on the entire dataset
+    X_poly = poly.fit_transform(X)
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    cv_scores = cross_val_score(LinearRegression(), X_poly, y, cv=kf, scoring='r2')
+    
+    # Print cross-validation scores
+    print(f"Cross-Validation R² Scores for {state_name} (Polynomial Degree {degree}): {cv_scores}")
+    print(f"Mean Cross-Validation R² Score: {cv_scores.mean():.4f}")
+    
+    # Generate a continuous range for smoother plotting
+    x_range = np.linspace(X['year'].min(), X['year'].max(), 300).reshape(-1, 1)
+    x_range_poly = poly.transform(x_range)
+    y_range_pred = model.predict(sm.add_constant(x_range_poly))
+    
+    # Plot the actual and predicted values
+    plt.figure(figsize=(10, 6))
+    plt.scatter(X['year'], y, color='blue', label='Actual Emissions')
+    plt.plot(x_range, y_range_pred, 'k-', label='Polynomial Fit Curve')
+    plt.xlabel('Year')
+    plt.ylabel('Emissions')
+    plt.title(f'Emissions Over Time in {state_name}')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return model
+
+# Filter data for the US, Texas, and the District of Columbia
+us_data = minimal_df.groupby('year')['value'].sum().reset_index()
+texas_data = minimal_df[minimal_df['state-name'] == 'Texas'].groupby('year')['value'].sum().reset_index()
+dc_data = minimal_df[minimal_df['state-name'] == 'District of Columbia'].groupby('year')['value'].sum().reset_index()
+
+# Create and plot polynomial models with cross-validation
+us_poly_model = create_polynomial_model(us_data, 'the United States', degree=3)
+texas_poly_model = create_polynomial_model(texas_data, 'Texas', degree=2)
+dc_poly_model = create_polynomial_model(dc_data, 'the District of Columbia', degree=2)
+```
+
+#### **Polynomial Regression Using Year and Population as Predictors**
+
+For this polynomial regression I split the data into 80% for training and 20% for testing. Due to the small sample size this means there is very little data in each grouping (training and test).
+
+US - Training R squared - .89 | Test R squared - .71 : training performance is improved from the last model, but test is slightly lower, there could be a bit of overfitting.  x1, x3, and x5 are all statistically significant to this model. 
+
+Texas - Training R squared - .93 | Test R squared - .89 :  x1, and x3 are statistically significant to this model. 
+
+DC - Training R squared - .86 | Test R squared - .82 :  x1, and x3 are statistically significant to this model.  
+
+As predicted with the previous polynomial regression, it seems that the statewise models have less statistically significant predictors, which could imply a single state is somewhat simpler to model than the whole country.  
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Suppress UserWarning from sklearn
+warnings.filterwarnings(action='ignore', category=UserWarning, module='sklearn')
+warnings.filterwarnings("ignore", message="divide by zero encountered in scalar divide")
+
+# Function to create and plot polynomial model and print summary statistics
+def create_polynomial_model(data, state_name, degree=2):
+    # Prepare data
+    X = data[['year', 'Population']]
+    y = data['value']
+    
+    # Generate polynomial features
+    poly = PolynomialFeatures(degree)
+    X_poly = poly.fit_transform(X)
+    
+    # Split data into training and testing set
+    X_train, X_test, y_train, y_test = train_test_split(X_poly, y, test_size=0.2, random_state=42)
+    
+    # Fit the model using statsmodels
+    model = sm.OLS(y_train, X_train).fit()
+    
+    # Print the summary statistics
+    print(f"Summary for {state_name} (Polynomial Degree {degree}):\n")
+    print(model.summary())
+    
+    # Predict the values on the training set
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+    
+    # Calculate and print metrics for training set
+    train_mae = mean_absolute_error(y_train, y_train_pred)
+    train_mse = mean_squared_error(y_train, y_train_pred)
+    train_r2 = r2_score(y_train, y_train_pred)
+    print(f"\nTraining Set Metrics for {state_name} (Polynomial Degree {degree})\n"
+          f"MAE: {train_mae:.4f}\n"
+          f"MSE: {train_mse:.4f}\n"
+          f"R²: {train_r2:.4f}\n")
+    
+    # Calculate and print metrics for test set
+    test_mae = mean_absolute_error(y_test, y_test_pred)
+    test_mse = mean_squared_error(y_test, y_test_pred)
+    test_r2 = r2_score(y_test, y_test_pred)
+    print(f"Test Set Metrics for {state_name} (Polynomial Degree {degree})\n"
+          f"MAE: {test_mae:.4f}\n"
+          f"MSE: {test_mse:.4f}\n"
+          f"R²: {test_r2:.4f}\n")
+    
+    # Plot the actual and predicted values (only for the training set for simplicity)
+    plt.figure(figsize=(10, 6))
+    plt.scatter(X['year'], y, color='blue', label='Actual Values')
+    plt.scatter(X['year'], model.predict(poly.fit_transform(X)), color='red', label='Predicted Values')
+    plt.xlabel('Year')
+    plt.ylabel('Value')
+    plt.title(f'Values Over Time in {state_name} (Polynomial Degree {degree})')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    return model
+
+# Assuming minimal_df has 'year', 'population', 'value', and 'state-name' columns
+# Filter data for the US, Texas, and the District of Columbia
+us_data = minimal_df.groupby('year').agg({'value': 'sum', 'Population': 'sum'}).reset_index()
+texas_data = minimal_df[minimal_df['state-name'] == 'Texas'].groupby('year').agg({'value': 'sum', 'Population': 'sum'}).reset_index()
+dc_data = minimal_df[minimal_df['state-name'] == 'District of Columbia'].groupby('year').agg({'value': 'sum', 'Population': 'sum'}).reset_index()
+
+# Create and plot polynomial models
+us_model = create_polynomial_model(us_data, 'the United States', degree=2)
+texas_model = create_polynomial_model(texas_data, 'Texas', degree=2)
+dc_model = create_polynomial_model(dc_data, 'the District of Columbia', degree=2)
+```
+
+#### **K-means Clustering to determine which states have similiar emissions**
+
+First using the curved elbow chart to determine the best number of clusters for this data using states, emissions value, and year. I determined about 3 is probably optimal.  
+
+```{python}
+#| tags: []
+import os
+
+# Set the environment variable LOKY_MAX_CPU_COUNT 
+os.environ["LOKY_MAX_CPU_COUNT"] = "4" 
+
+# Aggregate emissions by State and Year
+state_year_emissions = minimal_df.groupby(['state-name', 'year'])['value'].sum().reset_index()
+
+# Determine the optimal number of clusters using the elbow method
+sum_of_squared_distances = []
+K = range(1, 10)
+for k in K:
+    kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)  # Set n_init to 10 explicitly
+    kmeans = kmeans.fit(state_year_emissions[['value']])
+    sum_of_squared_distances.append(kmeans.inertia_)
+
+# Plot the elbow curve
+plt.figure(figsize=(10, 6))
+plt.plot(K, sum_of_squared_distances, 'bx-')
+plt.xlabel('Number of clusters')
+plt.ylabel('Sum of squared distances')
+plt.title('Elbow Method For Optimal k')
+plt.show()
+```
+
+Three clear clusters emerged. Below is a list of all the states that more or less fall into the clusters. The clusters represent high, medium, and low emissions groupings of states.
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Choose the optimal number of clusters (e.g., 3) based on the elbow curve
+optimal_clusters = 3
+kmeans = KMeans(n_clusters=optimal_clusters, random_state=42, n_init=10)  # Set n_init to 10 explicitly
+state_year_emissions['Cluster'] = kmeans.fit_predict(state_year_emissions[['value']])
+
+# Plot the clusters
+plt.figure(figsize=(10, 6))
+sns.scatterplot(data=state_year_emissions, x='year', y='value', hue='Cluster', palette='viridis')
+plt.title('State Emissions Clustering Over Time')
+plt.xlabel('Year')
+plt.ylabel('Total Emissions')
+plt.legend(title='Cluster')
+plt.tight_layout()
+plt.show()
+
+# Analyze the clusters
+cluster_analysis = state_year_emissions.groupby('Cluster').agg({'value': ['mean', 'sum'], 'state-name': 'count'}).reset_index()
+print(cluster_analysis)
+```
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Group the data by clusters and extract state names
+state_names_by_cluster = state_year_emissions.groupby('Cluster')['state-name'].unique()
+
+# Print state names in each cluster
+for cluster, states in state_names_by_cluster.items():
+    print(f"Cluster {cluster}:")
+    for state in states:
+        print(f"  - {state}")
+```
+
+After determining clusters, I analyzed what the primary industry and fuel types are in each cluster to determine if there are any similarities. Percentages have been added to the bar chart to better compare between states despite relative value being so significantly different. 
+
+Some notable results: 
+ - Petroleum in the Transportation industry makes up around 30% of emissions for all clusters. 
+ - Natural gas makes up 35.6% of emissions in cluster 1. 18.4% for cluster 0, and 23.3% for cluster 2.  
+ - Cluster 1 has significantly higher petroleum emissions in the industrial sector (15.7% vs 6.2% and 7%)
+
+```{python}
+#| jupyter: {source_hidden: true}
+#| tags: []
+# Merge the original data with the cluster information
+df = minimal_df.merge(state_year_emissions[['state-name', 'year', 'Cluster']], on=['state-name', 'year'])
+
+# Aggregate data by cluster, fuel type, and industry
+fuel_industry_analysis = df.groupby(['Cluster', 'fuel-name', 'sector-name'])['value'].sum().reset_index()
+
+# Plotting the data for each cluster
+for cluster in fuel_industry_analysis['Cluster'].unique():
+    cluster_data = fuel_industry_analysis[fuel_industry_analysis['Cluster'] == cluster]
+    cluster_total = cluster_data['value'].sum()
+    
+    plt.figure(figsize=(12, 8))
+    ax = sns.barplot(data=cluster_data, x='fuel-name', y='value', hue='sector-name')
+
+    # Annotate bars with percentages
+    for p in ax.patches:
+        percentage = '{:.1f}%'.format(100 * p.get_height() / cluster_total)
+        x = p.get_x() + p.get_width() / 2 - 0.1
+        y = p.get_height()
+        ax.annotate(percentage, (x, y), ha='center', va='bottom')
+    
+    plt.title(f'Emissions by Fuel Type and Industry for Cluster {cluster}')
+    plt.xlabel('Fuel Type')
+    plt.ylabel('Total Emissions')
+    plt.legend(title='Industry')
+    plt.tight_layout()
+    plt.show()
+```
+
+## **Results**
+
+1. How have carbon dioxide emissions trends varied across different states from 1970 to 2021? The majority of the analysis in this notebook was dedicated to exporing this. For the most part most states have increased in their CO2 emissions since 1970 - but the relationship is not strictly linear. Some states (like DC) have seen a decrease in emissions, and others like Texas have seen a nearly linear increase.
+
+2. Which sectors have been the most significant contributors to emissions? According to the bar graph we can see that the most significant contributer was electric power CO2 emissions. Further analysis could be conducted by paying closer attention to the primary industries in each state (need to add more data to the dataset) to get an idea of how industry and civilian use impact the relationship between sector and emissions.
+
+4. Is there a discernible pattern among states with similar emission levels? I was able to perform cluster analysis to find 3 distinct groups of states based on emissions level. Further analysis revealed certain differences in the sector and fuel type emissions for the states with the highest emissions. Notably, petroleum used in industrial sectors and natural gas in industrial sectors make up a larger percentage of these states emissions than the other clusters. 
+
+#### **Impact**
+
+Analysis like this may lead the government to believe that they need to impose stricter regulations or mandate more aggresive renewable energy targets - which they may. In using clustering analysis the federal government might be able to make better decisions regarding how to address and lower CO2 emissions. Particularly by understanding the fuel types and sectors that contribute to the emissions most in the the biggest polluting states may help to create strategies to switch to alternative fuel types that may cause less extreme emissions.  
+However, it is important to understand that this analysis does not establish causality. While it can help guide strategic decisions, the results should be interpreted with caution.
+
+**References**
+
+- Sarah Flood, Miriam King, Renae Rodgers, Steven Ruggles, J. Robert Warren, Daniel Backman, Annie Chen, Grace Cooper, Stephanie Richards, Megan Schouweiler, and Michael Westberry. IPUMS CPS: Version 11.0 [dataset]. Minneapolis, MN: IPUMS, 2023.
+https://doi.org/10.18128/D030.V11.0
+
+- U.S. Bureau of Economic Analysis. "GDP by State." Apps.BEA.gov API, using 'GetData' method for 'Regional' dataset, SAGDP1 Table. Accessed 13 June 2024. <https://apps.bea.gov/api/data/>.
+
+- U.S. Census Bureau. "TIGER/Line Shapefile, States, United States, 2021." Census Bureau, 2021. Web. Accessed 13 June 2024. <https://www.census.gov/geographies/mapping-files/time-series/geo/tiger-line-file.html>.
+
+
+
+
+
